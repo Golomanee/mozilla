@@ -154,8 +154,8 @@ def get_platform_info(line):
     if "asan" in line: build_type, is_sanitizer = "asan", True
     elif "tsan" in line: build_type, is_sanitizer = "tsan", True
 
-    # Sanitizers imply opt, so skip debug/!debug tags
-    build_mode = "any" if is_sanitizer else ("debug" if "debug" in line else "!debug")
+    # Sanitizers imply opt, so skip debug/opt tags
+    build_mode = "any" if is_sanitizer else ("debug" if "debug" in line else "opt")
 
     return os_part, arch, detected_variant, build_type, build_mode
 
@@ -200,13 +200,13 @@ def generate_skips():
                     if modes.get("any", 0) >= THRESHOLD:
                         return ("any", modes["any"])
                 else:
-                    d_c, o_c = modes.get("debug", 0), modes.get("!debug", 0)
+                    d_c, o_c = modes.get("debug", 0), modes.get("opt", 0)
                     if d_c >= THRESHOLD and o_c >= THRESHOLD:
                         return ("both", d_c + o_c)
                     elif d_c >= THRESHOLD:
                         return ("debug", d_c)
                     elif o_c >= THRESHOLD:
-                        return ("!debug", o_c)
+                        return ("opt", o_c)
                 return None
             
             qual_64 = get_qualifying_mode(x86_64_modes)
@@ -227,7 +227,7 @@ def generate_skips():
                     elif mode_type == "debug":
                         candidates.append((f"{base} && debug", combined_count))
                     else:
-                        candidates.append((f"{base} && !debug", combined_count))
+                        candidates.append((f"{base} && opt", combined_count))
             else:
                 # Handle each architecture separately
                 for arch in arch_data:
@@ -242,13 +242,13 @@ def generate_skips():
                         if modes.get("any", 0) >= THRESHOLD:
                             candidates.append((f"{base} && {b_type}", modes["any"]))
                     else:
-                        d_c, o_c = modes.get("debug", 0), modes.get("!debug", 0)
+                        d_c, o_c = modes.get("debug", 0), modes.get("opt", 0)
                         if d_c >= THRESHOLD and o_c >= THRESHOLD:
                             candidates.append((base, d_c + o_c))
                         elif d_c >= THRESHOLD:
                             candidates.append((f"{base} && debug", d_c))
                         elif o_c >= THRESHOLD:
-                            candidates.append((f"{base} && !debug", o_c))
+                            candidates.append((f"{base} && opt", o_c))
 
     final_results = remove_redundant(candidates)
     
@@ -282,7 +282,7 @@ def merge_asan_tsan_to_opt(candidates):
         if "asan" in sanitizers and "tsan" in sanitizers:
             # Both exist, merge into "opt"
             combined_count = sanitizers["asan"][1] + sanitizers["tsan"][1]
-            merged.append((f"{base} && !debug", combined_count))
+            merged.append((f"{base} && opt", combined_count))
         else:
             # Only one exists, keep as is
             for san_type, (cond, count) in sanitizers.items():
