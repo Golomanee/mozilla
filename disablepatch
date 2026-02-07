@@ -7,12 +7,12 @@ from collections import defaultdict
 # =============================================================================
 # CONFIGURATION - Only change these values
 # =============================================================================
-BUG_ID = "2015135"
-THRESHOLD = 10
+BUG_ID = "1787024"
+THRESHOLD = 5  # Minimum number of failures to consider a skip-worthy condition
 
 # Your Redash API key - get it from https://sql.telemetry.mozilla.org/users/me
 # Keep this secret! Consider using an environment variable instead.
-REDASH_API_KEY = "your_api_key_here"
+REDASH_API_KEY = "your_api_key"
 
 # Redash query ID (from the URL: /queries/114520/...)
 REDASH_QUERY_ID = 114520
@@ -136,6 +136,10 @@ def get_platform_info(line):
         os_part = "os == 'linux' && os_version == '18.04'"
     elif "macosx1015" in line:
         os_part = "os == 'mac' && os_version == '10.15'"
+    elif "macosx1500" in line:
+        os_part = "os == 'mac' && os_version == '15.00'"
+    elif "android" in line:
+        os_part = "os == 'android'"
     else: return None, None, None, None, None
 
     arch = "x86_64" if "64" in line else "x86"
@@ -247,11 +251,45 @@ def generate_skips():
                             candidates.append((f"{base} && !debug", o_c))
 
     final_results = remove_redundant(candidates)
+    
+    # Merge asan and tsan with the same base condition into "opt"
+    final_results = merge_asan_tsan_to_opt(final_results)
+    
     print(f"\n# Skip-if block for Bug {BUG_ID}")
     print("skip-if = [")
     for cond, count in final_results:
         print(f"  \"{cond}\", # Bug {BUG_ID} - {count} failures")
     print("]")
+
+def merge_asan_tsan_to_opt(candidates):
+    """Merge asan and tsan conditions with the same base into a single 'opt' condition."""
+    # Group by base condition (without asan/tsan suffix)
+    base_groups = defaultdict(dict)
+    non_sanitizer = []
+    
+    for cond, count in candidates:
+        if " && asan" in cond:
+            base = cond.replace(" && asan", "")
+            base_groups[base]["asan"] = (cond, count)
+        elif " && tsan" in cond:
+            base = cond.replace(" && tsan", "")
+            base_groups[base]["tsan"] = (cond, count)
+        else:
+            non_sanitizer.append((cond, count))
+    
+    merged = []
+    for base, sanitizers in base_groups.items():
+        if "asan" in sanitizers and "tsan" in sanitizers:
+            # Both exist, merge into "opt"
+            combined_count = sanitizers["asan"][1] + sanitizers["tsan"][1]
+            merged.append((f"{base} && !debug", combined_count))
+        else:
+            # Only one exists, keep as is
+            for san_type, (cond, count) in sanitizers.items():
+                merged.append((cond, count))
+    
+    result = non_sanitizer + merged
+    return sorted(result, key=lambda x: x[0])
 
 if __name__ == "__main__":
     generate_skips()
