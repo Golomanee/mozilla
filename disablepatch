@@ -132,6 +132,8 @@ def get_platform_info(line):
         os_part = "os == 'linux' && os_version == '24.04'"
     elif "linux2204" in line:
         os_part = "os == 'linux' && os_version == '22.04'"
+    elif "linux1804" in line:
+        os_part = "os == 'linux' && os_version == '18.04'"
     elif "macosx1015" in line:
         os_part = "os == 'mac' && os_version == '10.15'"
     else: return None, None, None, None, None
