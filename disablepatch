@@ -1,0 +1,255 @@
+import csv
+import io
+import time
+import requests
+from collections import defaultdict
+
+# =============================================================================
+# CONFIGURATION - Only change these values
+# =============================================================================
+BUG_ID = "2015135"
+THRESHOLD = 10
+
+# Your Redash API key - get it from https://sql.telemetry.mozilla.org/users/me
+# Keep this secret! Consider using an environment variable instead.
+REDASH_API_KEY = "your_api_key_here"
+
+# Redash query ID (from the URL: /queries/114520/...)
+REDASH_QUERY_ID = 114520
+REDASH_BASE_URL = "https://sql.telemetry.mozilla.org"
+# =============================================================================
+
+def fetch_data_from_redash(bug_id):
+    """Fetches job_type_name data directly from Redash API."""
+    headers = {"Authorization": f"Key {REDASH_API_KEY}"}
+    
+    # Trigger query execution with the bug_id parameter
+    payload = {
+        "parameters": {"bug_id": bug_id},
+        "max_age": 0  # Force fresh execution
+    }
+    
+    print(f"Querying Redash for Bug {bug_id}...")
+    response = requests.post(
+        f"{REDASH_BASE_URL}/api/queries/{REDASH_QUERY_ID}/results",
+        headers=headers,
+        json=payload
+    )
+    response.raise_for_status()
+    result = response.json()
+    
+    # Check if we got a job (query is running) or immediate result
+    if "job" in result:
+        job_id = result["job"]["id"]
+        print(f"Query job started (ID: {job_id}). Waiting for results...")
+        
+        # Poll for job completion
+        while True:
+            job_response = requests.get(
+                f"{REDASH_BASE_URL}/api/jobs/{job_id}",
+                headers=headers
+            )
+            job_response.raise_for_status()
+            job_data = job_response.json()["job"]
+            
+            status = job_data["status"]
+            if status == 3:  # SUCCESS
+                query_result_id = job_data["query_result_id"]
+                break
+            elif status == 4:  # FAILURE
+                raise Exception(f"Query failed: {job_data.get('error', 'Unknown error')}")
+            elif status == 5:  # CANCELLED
+                raise Exception("Query was cancelled")
+            
+            time.sleep(1)  # Wait before polling again
+        
+        # Fetch the actual results
+        result_response = requests.get(
+            f"{REDASH_BASE_URL}/api/query_results/{query_result_id}",
+            headers=headers
+        )
+        result_response.raise_for_status()
+        result = result_response.json()
+    
+    # Extract job_type_name from results
+    rows = result.get("query_result", {}).get("data", {}).get("rows", [])
+    job_list = [row["job_type_name"] for row in rows if "job_type_name" in row]
+    print(f"Retrieved {len(job_list)} job entries")
+    return job_list
+
+def load_data_from_csv(filename):
+    """Reads the 'job_type_name' column from the CSV file (fallback)."""
+    job_list = []
+    try:
+        with open(filename, 'r', encoding='utf-8') as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                if 'job_type_name' in row:
+                    job_list.append(row['job_type_name'])
+    except FileNotFoundError:
+        print(f"Error: Could not find {filename}")
+        return []
+    return job_list
+
+# Fetch data from Redash API (or use CSV as fallback)
+if REDASH_API_KEY != "YOUR_API_KEY_HERE":
+    raw_job_list = fetch_data_from_redash(BUG_ID)
+else:
+    print("No API key configured. Using CSV file as fallback.")
+    print("To use the API, set REDASH_API_KEY from https://sql.telemetry.mozilla.org/users/me")
+    raw_job_list = load_data_from_csv('bug.csv')
+
+# List of variants to detect
+VARIANTS = [
+    "a11y_checks", "condprof", "fission", "headless", "http2", "http3", 
+    "mda_gpu", "msix", "nogpu", "snapshot", "socketprocess_e10s", 
+    "socketprocess_networking", "swgl", "trainhop"
+]
+
+def remove_redundant(candidates_with_counts):
+    parsed = []
+    for cond, count in candidates_with_counts:
+        parts = set([p.strip() for p in cond.split('&&')])
+        parsed.append({'str': cond, 'set': parts, 'count': count})
+
+    final = []
+    for current in parsed:
+        is_covered = False
+        for other in parsed:
+            if current['str'] == other['str']: continue
+            if other['set'].issubset(current['set']):
+                is_covered = True
+                break
+        if not is_covered:
+            final.append((current['str'], current['count']))
+    return sorted(final, key=lambda x: x[0])
+
+def get_platform_info(line):
+    # OS Detection
+    if "windows11" in line:
+        os_part = "os == 'win'" 
+    elif "linux2404" in line:
+        os_part = "os == 'linux' && os_version == '24.04'"
+    elif "linux2204" in line:
+        os_part = "os == 'linux' && os_version == '22.04'"
+    elif "macosx1015" in line:
+        os_part = "os == 'mac' && os_version == '10.15'"
+    else: return None, None, None, None, None
+
+    arch = "x86_64" if "64" in line else "x86"
+    
+    # Variant Mapping
+    detected_variant = next((v for v in VARIANTS if v in line or v.replace('_', '-') in line), None)
+    if "a11y-checks" in line: detected_variant = "a11y_checks"
+
+    # Build Type & Sanitizer Logic
+    build_type = "standard"
+    is_sanitizer = False
+    if "asan" in line: build_type, is_sanitizer = "asan", True
+    elif "tsan" in line: build_type, is_sanitizer = "tsan", True
+
+    # Sanitizers imply opt, so skip debug/!debug tags
+    build_mode = "any" if is_sanitizer else ("debug" if "debug" in line else "!debug")
+
+    return os_part, arch, detected_variant, build_type, build_mode
+
+def generate_skips():
+    stats = defaultdict(lambda: defaultdict(lambda: defaultdict(lambda: defaultdict(int))))
+    
+    # ITERATE OVER THE LIST INSTEAD OF SPLITTING A STRING
+    for line in raw_job_list:
+        os_p, arch, var, b_type, b_mode = get_platform_info(line)
+        if os_p: 
+            stats[(os_p, arch)][var][b_type][b_mode] += 1
+
+    candidates = []
+    
+    # Group by os_p to check if both architectures can be merged
+    os_groups = defaultdict(dict)
+    for (os_p, arch), variants in stats.items():
+        os_groups[os_p][arch] = variants
+    
+    for os_p, arch_data in os_groups.items():
+        # Get all unique (var, b_type, mode) combinations across architectures
+        all_keys = set()
+        for arch, variants in arch_data.items():
+            for var, b_types in variants.items():
+                for b_type, modes in b_types.items():
+                    all_keys.add((var, b_type))
+        
+        for var, b_type in all_keys:
+            # Gather counts for each architecture
+            arch_counts = {}
+            for arch in arch_data:
+                modes = arch_data[arch].get(var, {}).get(b_type, {})
+                arch_counts[arch] = modes
+            
+            # Check if both x86_64 and x86 are present and over threshold with same specs
+            x86_64_modes = arch_counts.get("x86_64", {})
+            x86_modes = arch_counts.get("x86", {})
+            
+            def get_qualifying_mode(modes):
+                """Returns which mode qualifies and combined count, or None"""
+                if b_type in ["asan", "tsan"]:
+                    if modes.get("any", 0) >= THRESHOLD:
+                        return ("any", modes["any"])
+                else:
+                    d_c, o_c = modes.get("debug", 0), modes.get("!debug", 0)
+                    if d_c >= THRESHOLD and o_c >= THRESHOLD:
+                        return ("both", d_c + o_c)
+                    elif d_c >= THRESHOLD:
+                        return ("debug", d_c)
+                    elif o_c >= THRESHOLD:
+                        return ("!debug", o_c)
+                return None
+            
+            qual_64 = get_qualifying_mode(x86_64_modes)
+            qual_32 = get_qualifying_mode(x86_modes)
+            
+            # If both architectures qualify with the same mode, merge them (no arch specified)
+            if qual_64 and qual_32 and qual_64[0] == qual_32[0]:
+                base = os_p
+                if var: base += f" && {var}"
+                combined_count = qual_64[1] + qual_32[1]
+                
+                if b_type in ["asan", "tsan"]:
+                    candidates.append((f"{base} && {b_type}", combined_count))
+                else:
+                    mode_type = qual_64[0]
+                    if mode_type == "both":
+                        candidates.append((base, combined_count))
+                    elif mode_type == "debug":
+                        candidates.append((f"{base} && debug", combined_count))
+                    else:
+                        candidates.append((f"{base} && !debug", combined_count))
+            else:
+                # Handle each architecture separately
+                for arch in arch_data:
+                    modes = arch_data[arch].get(var, {}).get(b_type, {})
+                    if not modes:
+                        continue
+                    
+                    base = f"{os_p} && arch == '{arch}'"
+                    if var: base += f" && {var}"
+                    
+                    if b_type in ["asan", "tsan"]:
+                        if modes.get("any", 0) >= THRESHOLD:
+                            candidates.append((f"{base} && {b_type}", modes["any"]))
+                    else:
+                        d_c, o_c = modes.get("debug", 0), modes.get("!debug", 0)
+                        if d_c >= THRESHOLD and o_c >= THRESHOLD:
+                            candidates.append((base, d_c + o_c))
+                        elif d_c >= THRESHOLD:
+                            candidates.append((f"{base} && debug", d_c))
+                        elif o_c >= THRESHOLD:
+                            candidates.append((f"{base} && !debug", o_c))
+
+    final_results = remove_redundant(candidates)
+    print(f"\n# Skip-if block for Bug {BUG_ID}")
+    print("skip-if = [")
+    for cond, count in final_results:
+        print(f"  \"{cond}\", # Bug {BUG_ID} - {count} failures")
+    print("]")
+
+if __name__ == "__main__":
+    generate_skips()
