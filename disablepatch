@@ -291,5 +291,10 @@ def merge_asan_tsan_to_opt(candidates):
     result = non_sanitizer + merged
     return sorted(result, key=lambda x: x[0])
 
+def print_commit_message():
+    print(f"\n# Commit message for Bug {BUG_ID}")
+    print(f"Bug {BUG_ID} - disable [test] for causing frequent failures. r=#intermittent-reviewers")
+
 if __name__ == "__main__":
     generate_skips()
+    print_commit_message()
