@@ -95,7 +95,6 @@ def load_data_from_csv(filename):
 if REDASH_API_KEY != "YOUR_API_KEY_HERE":
     raw_job_list = fetch_data_from_redash(BUG_ID)
 else:
-    print("No API key configured. Using CSV file as fallback.")
     print("To use the API, set REDASH_API_KEY from https://sql.telemetry.mozilla.org/users/me")
     raw_job_list = load_data_from_csv('bug.csv')
 
